@@ -428,6 +428,37 @@ HTML_PAGE = """
       background: #fff;
     }
 
+    .sort-bar {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .sort-card {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      background: #f8fbff;
+    }
+
+    .sort-card label {
+      display: block;
+      font-size: 13px;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: var(--muted);
+    }
+
+    .sort-card select {
+      width: 100%;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 14px;
+      background: #fff;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -508,7 +539,8 @@ HTML_PAGE = """
     @media (max-width: 640px) {
       .volumes-grid,
       .mini-grid,
-      .kpis {
+      .kpis,
+      .sort-bar {
         grid-template-columns: 1fr;
       }
     }
@@ -603,7 +635,7 @@ HTML_PAGE = """
               <div class="muted">Melhor opção encontrada</div>
               <h2 id="best-title" style="margin: 4px 0 0; font-size: 24px;"></h2>
             </div>
-            <div class="best-badge">Menor preço</div>
+            <div class="best-badge">Ordenação aplicada</div>
           </div>
           <div id="best-company" class="muted"></div>
           <div class="kpis">
@@ -635,6 +667,25 @@ HTML_PAGE = """
 
         <div id="results-content" style="display: none;">
           <h2 class="section-title" style="margin-top: 0;">Opções retornadas</h2>
+
+          <div class="sort-bar">
+            <div class="sort-card">
+              <label for="sort_by">Ordenar por</label>
+              <select id="sort_by">
+                <option value="price">Menor preço</option>
+                <option value="delivery_days">Mais rápido</option>
+              </select>
+            </div>
+
+            <div class="sort-card">
+              <label for="sort_order">Ordem</label>
+              <select id="sort_order">
+                <option value="asc">Crescente</option>
+                <option value="desc">Decrescente</option>
+              </select>
+            </div>
+          </div>
+
           <div class="table-wrap">
             <table>
               <thead>
@@ -673,8 +724,12 @@ HTML_PAGE = """
     const bestPrice = document.getElementById("best-price");
     const bestDays = document.getElementById("best-days");
     const bestBox = document.getElementById("best-box");
+    const sortBySelect = document.getElementById("sort_by");
+    const sortOrderSelect = document.getElementById("sort_order");
 
     let customVolumeIndex = 0;
+    let latestResults = [];
+    let latestTotalVolumes = 0;
 
     function onlyDigits(value) {
       return (value || "").replace(/\\D/g, "");
@@ -709,6 +764,8 @@ HTML_PAGE = """
     }
 
     function clearResults() {
+      latestResults = [];
+      latestTotalVolumes = 0;
       resultsBody.innerHTML = "";
       bestCard.classList.remove("show");
       contentBox.style.display = "none";
@@ -728,6 +785,41 @@ HTML_PAGE = """
       bestDays.textContent = best.delivery_label || "Não informado";
       bestBox.textContent = `${totalVolumes} volume(s)`;
       bestCard.classList.add("show");
+    }
+
+    function getSortableValue(item, sortBy) {
+      if (sortBy === "delivery_days") {
+        return item.delivery_days == null ? 999999 : Number(item.delivery_days);
+      }
+      return item.price == null ? 999999 : Number(item.price);
+    }
+
+    function sortResults(items) {
+      const sortBy = sortBySelect.value;
+      const sortOrder = sortOrderSelect.value;
+      const available = items.filter(item => !item.error && item.price != null);
+      const unavailable = items.filter(item => item.error || item.price == null);
+
+      available.sort((a, b) => {
+        const first = getSortableValue(a, sortBy);
+        const second = getSortableValue(b, sortBy);
+
+        if (first === second) {
+          const aPrice = a.price == null ? 999999 : Number(a.price);
+          const bPrice = b.price == null ? 999999 : Number(b.price);
+          const aDays = a.delivery_days == null ? 999999 : Number(a.delivery_days);
+          const bDays = b.delivery_days == null ? 999999 : Number(b.delivery_days);
+
+          if (sortBy === "delivery_days") {
+            return sortOrder === "asc" ? aPrice - bPrice : bPrice - aPrice;
+          }
+          return sortOrder === "asc" ? aDays - bDays : bDays - aDays;
+        }
+
+        return sortOrder === "asc" ? first - second : second - first;
+      });
+
+      return [...available, ...unavailable];
     }
 
     function renderRows(items) {
@@ -751,6 +843,17 @@ HTML_PAGE = """
       resultsBody.innerHTML = rows.join("");
       contentBox.style.display = "block";
       emptyBox.style.display = "none";
+    }
+
+    function applySortingAndRender() {
+      if (!latestResults.length) {
+        return;
+      }
+
+      const sorted = sortResults([...latestResults]);
+      const best = sorted.find(item => !item.error && item.price != null) || null;
+      fillBest(best, latestTotalVolumes);
+      renderRows(sorted);
     }
 
     async function parseResponse(response) {
@@ -817,6 +920,8 @@ HTML_PAGE = """
       document.getElementById("box2_weight").value = "0";
       customVolumesContainer.innerHTML = "";
       customVolumeIndex = 0;
+      sortBySelect.value = "price";
+      sortOrderSelect.value = "asc";
     }
 
     function buildStandardBoxes() {
@@ -862,6 +967,9 @@ HTML_PAGE = """
     addVolumeBtn.addEventListener("click", () => {
       addCustomVolume();
     });
+
+    sortBySelect.addEventListener("change", applySortingAndRender);
+    sortOrderSelect.addEventListener("change", applySortingAndRender);
 
     customVolumesContainer.addEventListener("click", (event) => {
       const target = event.target;
@@ -929,8 +1037,10 @@ HTML_PAGE = """
           throw new Error(detail);
         }
 
-        fillBest(data.best_option, data.total_volumes || totalVolumes);
-        renderRows(data.all_options || []);
+        latestResults = Array.isArray(data.all_options) ? data.all_options : [];
+        latestTotalVolumes = data.total_volumes || totalVolumes;
+
+        applySortingAndRender();
 
         if ((data.available_options || []).length === 0) {
           showStatus("Nenhuma opção disponível para esta consulta.", "info");
