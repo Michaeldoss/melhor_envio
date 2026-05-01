@@ -14,6 +14,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 app = FastAPI(title="Calculadora de Fretes", version="3.0.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
 MELHOR_ENVIO_BASE_URL = os.getenv("MELHOR_ENVIO_BASE_URL", "https://www.melhorenvio.com.br")
 MELHOR_ENVIO_TOKEN = os.getenv("MELHOR_ENVIO_TOKEN", "")
 MELHOR_ENVIO_USER_AGENT = os.getenv(
