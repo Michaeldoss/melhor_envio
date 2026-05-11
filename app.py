@@ -1,4 +1,3 @@
-# app.py
 from __future__ import annotations
 
 import os
@@ -12,7 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-app = FastAPI(title="Calculadora de Fretes", version="3.0.0")
+app = FastAPI(title="Calculadora de Fretes", version="4.2.0")
 
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -23,27 +22,17 @@ MELHOR_ENVIO_USER_AGENT = os.getenv(
     "MELHOR_ENVIO_USER_AGENT",
     "CalculadoraFretes/1.0 (suporte@suaempresa.com)",
 )
+
 DEFAULT_FROM_POSTAL_CODE = os.getenv("DEFAULT_FROM_POSTAL_CODE", "89228397")
-DEFAULT_FROM_CITY = "JOINVILLE"
-DEFAULT_FROM_UF = "SC"
 VIACEP_BASE_URL = os.getenv("VIACEP_BASE_URL", "https://viacep.com.br/ws")
+
 DISKTENHA_ENABLED = os.getenv("DISKTENHA_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DISKTENHA_CUBIC_DIVISOR = float(os.getenv("DISKTENHA_CUBIC_DIVISOR", "6000"))
 DISKTENHA_VOLUMINOUS_FEE = float(os.getenv("DISKTENHA_VOLUMINOUS_FEE", "3.0"))
 
 BOXES: dict[str, dict[str, float | str]] = {
-    "1": {
-        "label": "Caixa 1",
-        "width": 26.0,
-        "height": 19.0,
-        "length": 36.0,
-    },
-    "2": {
-        "label": "Caixa 2",
-        "width": 18.0,
-        "height": 18.0,
-        "length": 27.0,
-    },
+    "1": {"label": "Caixa 1", "width": 26.0, "height": 19.0, "length": 36.0},
+    "2": {"label": "Caixa 2", "width": 18.0, "height": 18.0, "length": 27.0},
 }
 
 DISKTENHA_TABLE: dict[str, dict[str, Any]] = {
@@ -70,9 +59,9 @@ DISKTENHA_TABLE: dict[str, dict[str, Any]] = {
     "CORUPA": {"price": 37.0, "delivery_text": "8h as 12 para coletas feitas no dia anterior a tarde e 15h as 18h para coletas feitas no mesmo dia pela manhã", "partner": None},
     "CURITIBA": {"price": 43.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
     "DOUTOR PEDRINHO": {"price": 45.0, "delivery_text": "2ª, 4ª e 6ª, até 12h", "partner": "FLASH SERVICOS"},
+    "FLORIANOPOLIS": {"price": 49.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
     "FLORIANOPOLIS CONTINENTE": {"price": 49.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
     "FLORIANOPOLIS ILHA": {"price": 49.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
-    "FLORIANOPOLIS": {"price": 49.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
     "GARUVA": {"price": 14.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
     "GASPAR": {"price": 42.0, "delivery_text": "8h as 12 para coletas feitas no dia anterior a tarde e 15h as 18h para coletas feitas no mesmo dia pela manhã", "partner": None},
     "GOVERNADOR CELSO RAMOS": {"price": 50.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
@@ -120,6 +109,430 @@ DISKTENHA_TABLE: dict[str, dict[str, Any]] = {
     "TIMBO": {"price": 40.0, "delivery_text": "8h as 12 para coletas feitas no dia anterior a tarde e 15h as 18h para coletas feitas no mesmo dia pela manhã", "partner": "FLASH SERVICOS"},
     "TROMBUDO CENTRAL": {"price": 58.0, "delivery_text": "Próximo dia útil após a coleta. Das 8h as 18h", "partner": None},
 }
+
+
+def digits_only(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+def format_cep(value: str) -> str:
+    digits = digits_only(value)
+    if len(digits) != 8:
+        return value
+    return f"{digits[:5]}-{digits[5:]}"
+
+
+def normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", (value or "").upper())
+    cleaned = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    for token in ["(", ")", "-", "/", ".", ","]:
+        cleaned = cleaned.replace(token, " ")
+    return " ".join(cleaned.split()).strip()
+
+
+def parse_price(item: dict[str, Any]) -> float | None:
+    raw = item.get("custom_price")
+    if raw in (None, "", 0, "0"):
+        raw = item.get("price")
+    if raw in (None, ""):
+        return None
+    try:
+        return float(str(raw).replace(",", "."))
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_delivery_days(item: dict[str, Any]) -> int | None:
+    raw = item.get("custom_delivery_time")
+    if raw in (None, ""):
+        raw = item.get("delivery_time")
+    try:
+        return int(raw) if raw not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def delivery_label_from_days(days: int | None) -> str:
+    if days is None:
+        return "-"
+    return f"{days} dia(s) úteis"
+
+
+def classify_service(service_name: str, company_name: str = "", delivery_text: str = "", delivery_days: int | None = None) -> str:
+    text = normalize_text(f"{company_name} {service_name} {delivery_text}")
+
+    if any(term in text for term in ["EXPRESSO", "EXPRESS", "SEDEX", "EFACIL", "AEREO", "URGENTE"]):
+        return "expresso"
+
+    if any(term in text for term in ["PAC", "ECOMMERCE", "RODOVIARIO", "STANDARD", "PACKAGE", "PONTO", "CENTRALIZADO", "COM"]):
+        return "economico"
+
+    if "PROXIMO DIA UTIL" in text:
+        return "expresso"
+
+    if delivery_days is not None:
+        if delivery_days <= 2:
+            return "expresso"
+        if delivery_days <= 7:
+            return "programado"
+
+    return "outro"
+
+
+def get_config_errors() -> list[str]:
+    errors: list[str] = []
+    if not MELHOR_ENVIO_TOKEN.strip():
+        errors.append("MELHOR_ENVIO_TOKEN não configurado.")
+    if not MELHOR_ENVIO_USER_AGENT.strip():
+        errors.append("MELHOR_ENVIO_USER_AGENT não configurado.")
+    elif "@" not in MELHOR_ENVIO_USER_AGENT:
+        errors.append("MELHOR_ENVIO_USER_AGENT deve conter um e-mail de contato.")
+    if len(digits_only(DEFAULT_FROM_POSTAL_CODE)) != 8:
+        errors.append("DEFAULT_FROM_POSTAL_CODE inválido.")
+    if DISKTENHA_CUBIC_DIVISOR <= 0:
+        errors.append("DISKTENHA_CUBIC_DIVISOR inválido.")
+    return errors
+
+
+class StandardBoxRequest(BaseModel):
+    box_type: str = Field(..., description="Tipo de caixa padrão")
+    quantity: int = Field(..., ge=0, description="Quantidade")
+    weight: float = Field(..., ge=0, description="Peso unitário em kg")
+
+    @field_validator("box_type")
+    @classmethod
+    def validate_box_type(cls, value: str) -> str:
+        if value not in BOXES:
+            raise ValueError("Tipo de caixa inválido.")
+        return value
+
+
+class CustomVolumeRequest(BaseModel):
+    width: float = Field(..., gt=0)
+    height: float = Field(..., gt=0)
+    length: float = Field(..., gt=0)
+    weight: float = Field(..., gt=0)
+    quantity: int = Field(..., gt=0)
+
+
+class QuoteRequest(BaseModel):
+    from_postal_code: str
+    to_postal_code: str
+    insurance_value: float = Field(default=0.0, ge=0)
+    standard_boxes: list[StandardBoxRequest] = Field(default_factory=list)
+    custom_volumes: list[CustomVolumeRequest] = Field(default_factory=list)
+    receipt: bool = False
+    own_hand: bool = False
+    collect: bool = False
+
+    @field_validator("from_postal_code", "to_postal_code")
+    @classmethod
+    def validate_postal_code(cls, value: str) -> str:
+        digits = digits_only(value)
+        if len(digits) != 8:
+            raise ValueError("CEP deve conter 8 dígitos.")
+        return digits
+
+    @field_validator("insurance_value")
+    @classmethod
+    def validate_insurance_value(cls, value: float) -> float:
+        try:
+            normalized = Decimal(str(value))
+        except InvalidOperation as exc:
+            raise ValueError("Valor de seguro inválido.") from exc
+        if normalized < 0:
+            raise ValueError("Valor de seguro não pode ser negativo.")
+        return float(normalized)
+
+    @model_validator(mode="after")
+    def validate_has_volumes(self) -> "QuoteRequest":
+        total_standard = sum(item.quantity for item in self.standard_boxes)
+        total_custom = sum(item.quantity for item in self.custom_volumes)
+        if total_standard + total_custom <= 0:
+            raise ValueError("Informe ao menos 1 volume para cotação.")
+        for item in self.standard_boxes:
+            if item.quantity > 0 and item.weight <= 0:
+                raise ValueError(f"Informe o peso unitário da {BOXES[item.box_type]['label']}.")
+        return self
+
+
+def build_volumes(req: QuoteRequest) -> list[dict[str, Any]]:
+    volumes: list[dict[str, Any]] = []
+
+    for item in req.standard_boxes:
+        if item.quantity <= 0:
+            continue
+        box = BOXES[item.box_type]
+        volumes.append(
+            {
+                "source": f"Caixa {item.box_type}",
+                "width": float(box["width"]),
+                "height": float(box["height"]),
+                "length": float(box["length"]),
+                "weight": item.weight,
+                "quantity": item.quantity,
+                "insurance_value": 0.0,
+            }
+        )
+
+    for index, item in enumerate(req.custom_volumes, start=1):
+        volumes.append(
+            {
+                "source": f"Volume adicional {index}",
+                "width": item.width,
+                "height": item.height,
+                "length": item.length,
+                "weight": item.weight,
+                "quantity": item.quantity,
+                "insurance_value": 0.0,
+            }
+        )
+
+    total_units = sum(int(v["quantity"]) for v in volumes)
+    if total_units <= 0:
+        raise HTTPException(status_code=422, detail="Nenhum volume válido informado.")
+
+    insurance_per_unit = round(req.insurance_value / total_units, 2) if req.insurance_value > 0 else 0.0
+    for volume in volumes:
+        volume["insurance_value"] = insurance_per_unit
+
+    return volumes
+
+
+def build_melhor_envio_payload(req: QuoteRequest, volumes: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "from": {"postal_code": req.from_postal_code},
+        "to": {"postal_code": req.to_postal_code},
+        "volumes": [
+            {
+                "width": volume["width"],
+                "height": volume["height"],
+                "length": volume["length"],
+                "weight": volume["weight"],
+                "insurance_value": volume["insurance_value"],
+                "quantity": volume["quantity"],
+            }
+            for volume in volumes
+        ],
+        "options": {
+            "receipt": req.receipt,
+            "own_hand": req.own_hand,
+            "collect": req.collect,
+        },
+    }
+
+
+def get_total_actual_weight(volumes: list[dict[str, Any]]) -> float:
+    return round(sum(float(v["weight"]) * int(v["quantity"]) for v in volumes), 3)
+
+
+def get_total_cubic_weight(volumes: list[dict[str, Any]], cubic_divisor: float) -> float:
+    total = 0.0
+    for volume in volumes:
+        cubic_cm = float(volume["width"]) * float(volume["height"]) * float(volume["length"])
+        total += (cubic_cm / cubic_divisor) * int(volume["quantity"])
+    return round(total, 3)
+
+
+def is_voluminous_load(volumes: list[dict[str, Any]], actual_weight: float) -> bool:
+    if 50 <= actual_weight <= 150:
+        return True
+    for volume in volumes:
+        if float(volume["height"]) > 112 or float(volume["width"]) > 105 or float(volume["length"]) > 155:
+            return True
+    return False
+
+
+class CepLookupClient:
+    def __init__(self, base_url: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json", "User-Agent": "CalculadoraFretes/1.0"})
+
+    def lookup(self, postal_code: str) -> dict[str, str]:
+        url = f"{self.base_url}/{postal_code}/json/"
+        try:
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Falha ao consultar CEP: {exc}") from exc
+
+        data = response.json()
+        if data.get("erro"):
+            raise HTTPException(status_code=422, detail="CEP de destino não encontrado.")
+
+        city = str(data.get("localidade") or "").strip()
+        uf = str(data.get("uf") or "").strip()
+        if not city or not uf:
+            raise HTTPException(status_code=422, detail="CEP sem cidade/UF válidos.")
+        return {"city": city, "uf": uf}
+
+
+class MelhorEnvioClient:
+    def __init__(self, token: str, base_url: str, user_agent: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": user_agent,
+            }
+        )
+
+    def calculate(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        url = f"{self.base_url}/api/v2/me/shipment/calculate"
+
+        try:
+            response = self.session.post(url, json=payload, timeout=30)
+        except requests.Timeout as exc:
+            raise HTTPException(status_code=504, detail="Timeout ao consultar o Melhor Envio.") from exc
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Erro de conexão com o Melhor Envio: {exc}") from exc
+
+        if response.status_code == 401:
+            raise HTTPException(status_code=401, detail="Token inválido, expirado ou revogado.")
+        if response.status_code == 403:
+            raise HTTPException(status_code=403, detail="Sem permissão para cotação na API do Melhor Envio.")
+        if response.status_code >= 400:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = response.text or "Erro desconhecido no Melhor Envio."
+            raise HTTPException(status_code=response.status_code, detail=detail)
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Resposta inválida do Melhor Envio: {response.text[:500]}") from exc
+
+        if not isinstance(data, list):
+            raise HTTPException(status_code=502, detail="Resposta inesperada da API do Melhor Envio.")
+
+        return data
+
+
+class DiskTenhaProvider:
+    def quote(self, destination_city: str, destination_uf: str, volumes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not DISKTENHA_ENABLED:
+            return []
+
+        normalized_city = normalize_text(destination_city)
+
+        if destination_uf.upper() not in {"SC", "PR"}:
+            return [
+                {
+                    "provider": "disktenha",
+                    "provider_label": "Disk&Tenha",
+                    "company_name": "Disk&Tenha",
+                    "service_name": "Tabela Joinville",
+                    "service_type": "outro",
+                    "price": None,
+                    "delivery_days": None,
+                    "delivery_label": "-",
+                    "error": f"Disk&Tenha não atende a UF {destination_uf.upper()} pela tabela local.",
+                    "metadata": {"city": destination_city, "uf": destination_uf},
+                }
+            ]
+
+        matched_rule = DISKTENHA_TABLE.get(normalized_city)
+        if matched_rule is None and normalized_city.startswith("FLORIANOPOLIS"):
+            matched_rule = DISKTENHA_TABLE.get("FLORIANOPOLIS")
+
+        if matched_rule is None:
+            return [
+                {
+                    "provider": "disktenha",
+                    "provider_label": "Disk&Tenha",
+                    "company_name": "Disk&Tenha",
+                    "service_name": "Tabela Joinville",
+                    "service_type": "outro",
+                    "price": None,
+                    "delivery_days": None,
+                    "delivery_label": "-",
+                    "error": f"Cidade {destination_city}/{destination_uf} não encontrada na tabela da Disk&Tenha.",
+                    "metadata": {"city": destination_city, "uf": destination_uf},
+                }
+            ]
+
+        actual_weight = get_total_actual_weight(volumes)
+        cubic_weight = get_total_cubic_weight(volumes, DISKTENHA_CUBIC_DIVISOR)
+        chargeable_weight = max(actual_weight, cubic_weight)
+
+        price = float(matched_rule["price"])
+        if chargeable_weight > 50:
+            price += chargeable_weight - 50
+
+        voluminous = is_voluminous_load(volumes, actual_weight)
+        if voluminous:
+            price += DISKTENHA_VOLUMINOUS_FEE
+
+        delivery_text = str(matched_rule["delivery_text"])
+        normalized_delivery = normalize_text(delivery_text)
+        delivery_days = 1 if "PROXIMO DIA UTIL" in normalized_delivery else None
+
+        return [
+            {
+                "provider": "disktenha",
+                "provider_label": "Disk&Tenha",
+                "company_name": "Disk&Tenha",
+                "service_name": "Tabela Joinville",
+                "service_type": classify_service("Tabela Joinville", "Disk&Tenha", delivery_text, delivery_days),
+                "price": round(price, 2),
+                "delivery_days": delivery_days,
+                "delivery_label": delivery_text,
+                "error": None,
+                "metadata": {
+                    "city": destination_city,
+                    "uf": destination_uf,
+                    "partner": matched_rule.get("partner"),
+                    "actual_weight": actual_weight,
+                    "cubic_weight": cubic_weight,
+                    "chargeable_weight": round(chargeable_weight, 3),
+                    "voluminous_fee_applied": voluminous,
+                    "base_price": matched_rule["price"],
+                    "table_city_used": normalized_city,
+                },
+            }
+        ]
+
+
+def normalize_melhor_envio_result(item: dict[str, Any]) -> dict[str, Any]:
+    company = item.get("company") or {}
+    company_name = company.get("name") or "Melhor Envio"
+    service_name = item.get("name") or "-"
+    days = parse_delivery_days(item)
+    price = parse_price(item)
+
+    return {
+        "provider": "melhor_envio",
+        "provider_label": "Melhor Envio",
+        "company_name": company_name,
+        "service_name": service_name,
+        "service_type": classify_service(service_name, company_name, "", days),
+        "price": price,
+        "delivery_days": days,
+        "delivery_label": delivery_label_from_days(days),
+        "error": item.get("error"),
+        "metadata": item,
+    }
+
+
+def provider_error_result(provider: str, provider_label: str, detail: Any) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "provider_label": provider_label,
+        "company_name": provider_label,
+        "service_name": "-",
+        "service_type": "outro",
+        "price": None,
+        "delivery_days": None,
+        "delivery_label": "-",
+        "error": detail if isinstance(detail, str) else str(detail),
+        "metadata": {},
+    }
+
 
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -462,6 +875,21 @@ HTML_PAGE = """
       background: #fff;
     }
 
+    .destination-box {
+      display: none;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 16px;
+      background: #f8fbff;
+      color: var(--text);
+      font-size: 14px;
+    }
+
+    .destination-box.show {
+      display: block;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -632,6 +1060,8 @@ HTML_PAGE = """
         <div id="status" class="status"></div>
         <div id="loading" class="loading">Consultando fretes...</div>
 
+        <div id="destination-box" class="destination-box"></div>
+
         <div id="best-card" class="best-card">
           <div class="best-head">
             <div>
@@ -729,10 +1159,12 @@ HTML_PAGE = """
     const bestBox = document.getElementById("best-box");
     const sortBySelect = document.getElementById("sort_by");
     const sortOrderSelect = document.getElementById("sort_order");
+    const destinationBox = document.getElementById("destination-box");
 
     let customVolumeIndex = 0;
     let latestResults = [];
     let latestTotalVolumes = 0;
+    let latestDestination = null;
 
     function onlyDigits(value) {
       return (value || "").replace(/\\D/g, "");
@@ -769,10 +1201,13 @@ HTML_PAGE = """
     function clearResults() {
       latestResults = [];
       latestTotalVolumes = 0;
+      latestDestination = null;
       resultsBody.innerHTML = "";
       bestCard.classList.remove("show");
       contentBox.style.display = "none";
       emptyBox.style.display = "grid";
+      destinationBox.textContent = "";
+      destinationBox.className = "destination-box";
     }
 
     function fillBest(best, totalVolumes) {
@@ -790,6 +1225,22 @@ HTML_PAGE = """
       bestCard.classList.add("show");
     }
 
+    function renderDestinationInfo() {
+      if (!latestDestination) {
+        destinationBox.textContent = "";
+        destinationBox.className = "destination-box";
+        return;
+      }
+
+      let text = `CEP identificado: ${latestDestination.city}/${latestDestination.uf}`;
+      if (latestDestination.disktenha_table_city) {
+        text += ` | Tabela Disk&Tenha: ${latestDestination.disktenha_table_city}`;
+      }
+
+      destinationBox.textContent = text;
+      destinationBox.className = "destination-box show";
+    }
+
     function getSortableValue(item, sortBy) {
       if (sortBy === "delivery_days") {
         return item.delivery_days == null ? 999999 : Number(item.delivery_days);
@@ -800,6 +1251,7 @@ HTML_PAGE = """
     function sortResults(items) {
       const sortBy = sortBySelect.value;
       const sortOrder = sortOrderSelect.value;
+
       const available = items.filter(item => !item.error && item.price != null);
       const unavailable = items.filter(item => item.error || item.price == null);
 
@@ -855,16 +1307,15 @@ HTML_PAGE = """
 
       const sorted = sortResults([...latestResults]);
       const best = sorted.find(item => !item.error && item.price != null) || null;
+
       fillBest(best, latestTotalVolumes);
+      renderDestinationInfo();
       renderRows(sorted);
     }
 
     async function parseResponse(response) {
       const rawText = await response.text();
-      if (!rawText) {
-        return {};
-      }
-
+      if (!rawText) return {};
       try {
         return JSON.parse(rawText);
       } catch {
@@ -967,10 +1418,7 @@ HTML_PAGE = """
       e.target.value = formatCep(e.target.value);
     });
 
-    addVolumeBtn.addEventListener("click", () => {
-      addCustomVolume();
-    });
-
+    addVolumeBtn.addEventListener("click", () => addCustomVolume());
     sortBySelect.addEventListener("change", applySortingAndRender);
     sortOrderSelect.addEventListener("change", applySortingAndRender);
 
@@ -994,6 +1442,7 @@ HTML_PAGE = """
 
       const standard_boxes = buildStandardBoxes();
       const custom_volumes = buildCustomVolumes();
+
       const payload = {
         from_postal_code: onlyDigits(document.getElementById("from_postal_code").value),
         to_postal_code: onlyDigits(document.getElementById("to_postal_code").value),
@@ -1024,9 +1473,7 @@ HTML_PAGE = """
       try {
         const response = await fetch("/api/quote", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
 
@@ -1042,6 +1489,11 @@ HTML_PAGE = """
 
         latestResults = Array.isArray(data.all_options) ? data.all_options : [];
         latestTotalVolumes = data.total_volumes || totalVolumes;
+        latestDestination = {
+          city: data.input?.destination_city || "-",
+          uf: data.input?.destination_uf || "-",
+          disktenha_table_city: data.input?.disktenha_table_city || null
+        };
 
         applySortingAndRender();
 
@@ -1061,406 +1513,6 @@ HTML_PAGE = """
 </body>
 </html>
 """
-
-
-class StandardBoxRequest(BaseModel):
-    box_type: str = Field(..., description="Tipo de caixa padrão")
-    quantity: int = Field(..., ge=0, description="Quantidade")
-    weight: float = Field(..., ge=0, description="Peso unitário em kg")
-
-    @field_validator("box_type")
-    @classmethod
-    def validate_box_type(cls, value: str) -> str:
-        if value not in BOXES:
-            raise ValueError("Tipo de caixa inválido.")
-        return value
-
-
-class CustomVolumeRequest(BaseModel):
-    width: float = Field(..., gt=0)
-    height: float = Field(..., gt=0)
-    length: float = Field(..., gt=0)
-    weight: float = Field(..., gt=0)
-    quantity: int = Field(..., gt=0)
-
-
-class QuoteRequest(BaseModel):
-    from_postal_code: str = Field(..., description="CEP de origem")
-    to_postal_code: str = Field(..., description="CEP de destino")
-    insurance_value: float = Field(default=0.0, ge=0, description="Valor declarado em reais")
-    standard_boxes: list[StandardBoxRequest] = Field(default_factory=list)
-    custom_volumes: list[CustomVolumeRequest] = Field(default_factory=list)
-    receipt: bool = Field(default=False)
-    own_hand: bool = Field(default=False)
-    collect: bool = Field(default=False)
-
-    @field_validator("from_postal_code", "to_postal_code")
-    @classmethod
-    def validate_postal_code(cls, value: str) -> str:
-        digits = digits_only(value)
-        if len(digits) != 8:
-            raise ValueError("CEP deve conter 8 dígitos.")
-        return digits
-
-    @field_validator("insurance_value")
-    @classmethod
-    def validate_insurance_value(cls, value: float) -> float:
-        try:
-            normalized = Decimal(str(value))
-        except InvalidOperation as exc:
-            raise ValueError("Valor de seguro inválido.") from exc
-        if normalized < 0:
-            raise ValueError("Valor de seguro não pode ser negativo.")
-        return float(normalized)
-
-    @model_validator(mode="after")
-    def validate_has_volumes(self) -> "QuoteRequest":
-        total_standard = sum(item.quantity for item in self.standard_boxes)
-        total_custom = sum(item.quantity for item in self.custom_volumes)
-        if total_standard + total_custom <= 0:
-            raise ValueError("Informe ao menos 1 volume para cotação.")
-        for item in self.standard_boxes:
-            if item.quantity > 0 and item.weight <= 0:
-                raise ValueError(f"Informe o peso unitário da {BOXES[item.box_type]['label']}.")
-        return self
-
-
-def digits_only(value: str) -> str:
-    return "".join(ch for ch in value if ch.isdigit())
-
-
-def format_cep(value: str) -> str:
-    digits = digits_only(value)
-    if len(digits) != 8:
-        return value
-    return f"{digits[:5]}-{digits[5:]}"
-
-
-def normalize_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value.upper())
-    return "".join(ch for ch in normalized if not unicodedata.combining(ch)).replace("(", " ").replace(")", " ").replace("-", " ").replace("/", " ").replace(".", " ").replace(",", " ").replace("  ", " ").strip()
-
-
-def get_config_errors() -> list[str]:
-    errors: list[str] = []
-
-    if not MELHOR_ENVIO_TOKEN.strip():
-        errors.append("MELHOR_ENVIO_TOKEN não configurado.")
-    if not MELHOR_ENVIO_USER_AGENT.strip():
-        errors.append("MELHOR_ENVIO_USER_AGENT não configurado.")
-    elif "@" not in MELHOR_ENVIO_USER_AGENT:
-        errors.append("MELHOR_ENVIO_USER_AGENT deve conter um e-mail de contato.")
-    if len(digits_only(DEFAULT_FROM_POSTAL_CODE)) != 8:
-        errors.append("DEFAULT_FROM_POSTAL_CODE inválido.")
-    if DISKTENHA_CUBIC_DIVISOR <= 0:
-        errors.append("DISKTENHA_CUBIC_DIVISOR inválido.")
-
-    return errors
-
-
-def build_volumes(req: QuoteRequest) -> list[dict[str, Any]]:
-    volumes: list[dict[str, Any]] = []
-
-    for item in req.standard_boxes:
-        if item.quantity <= 0:
-            continue
-        box = BOXES[item.box_type]
-        volumes.append(
-            {
-                "source": f"Caixa {item.box_type}",
-                "width": float(box["width"]),
-                "height": float(box["height"]),
-                "length": float(box["length"]),
-                "weight": item.weight,
-                "insurance_value": 0.0,
-                "quantity": item.quantity,
-            }
-        )
-
-    for index, item in enumerate(req.custom_volumes, start=1):
-        volumes.append(
-            {
-                "source": f"Volume adicional {index}",
-                "width": item.width,
-                "height": item.height,
-                "length": item.length,
-                "weight": item.weight,
-                "insurance_value": 0.0,
-                "quantity": item.quantity,
-            }
-        )
-
-    total_units = sum(int(volume["quantity"]) for volume in volumes)
-    if total_units <= 0:
-        raise HTTPException(status_code=422, detail="Nenhum volume válido informado.")
-
-    insurance_per_unit = round(req.insurance_value / total_units, 2) if req.insurance_value > 0 else 0.0
-
-    for volume in volumes:
-        volume["insurance_value"] = insurance_per_unit
-
-    return volumes
-
-
-def build_melhor_envio_payload(req: QuoteRequest, volumes: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "from": {
-            "postal_code": req.from_postal_code,
-        },
-        "to": {
-            "postal_code": req.to_postal_code,
-        },
-        "volumes": [
-            {
-                "width": volume["width"],
-                "height": volume["height"],
-                "length": volume["length"],
-                "weight": volume["weight"],
-                "insurance_value": volume["insurance_value"],
-                "quantity": volume["quantity"],
-            }
-            for volume in volumes
-        ],
-        "options": {
-            "receipt": req.receipt,
-            "own_hand": req.own_hand,
-            "collect": req.collect,
-        },
-    }
-
-
-def get_total_actual_weight(volumes: list[dict[str, Any]]) -> float:
-    return round(sum(float(v["weight"]) * int(v["quantity"]) for v in volumes), 3)
-
-
-def get_total_cubic_weight(volumes: list[dict[str, Any]], cubic_divisor: float) -> float:
-    total = 0.0
-    for volume in volumes:
-        cubic_cm = float(volume["width"]) * float(volume["height"]) * float(volume["length"])
-        total += (cubic_cm / cubic_divisor) * int(volume["quantity"])
-    return round(total, 3)
-
-
-def is_voluminous_load(volumes: list[dict[str, Any]], actual_weight: float) -> bool:
-    if 50 <= actual_weight <= 150:
-        return True
-    for volume in volumes:
-        if float(volume["height"]) > 112 or float(volume["width"]) > 105 or float(volume["length"]) > 155:
-            return True
-    return False
-
-
-def parse_price(item: dict[str, Any]) -> float:
-    raw = item.get("custom_price", item.get("price", "999999"))
-    try:
-        return float(str(raw).replace(",", "."))
-    except (ValueError, TypeError):
-        return 999999.0
-
-
-def parse_delivery_days(item: dict[str, Any]) -> int | None:
-    raw = item.get("custom_delivery_time", item.get("delivery_time"))
-    try:
-        return int(raw) if raw is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def delivery_days_to_label(days: int | None) -> str:
-    if days is None:
-        return "-"
-    return f"{days} dia(s)"
-
-
-def classify_service(delivery_text: str, delivery_days: int | None) -> str:
-    if "PROXIMO DIA UTIL" in normalize_text(delivery_text):
-        return "expresso"
-    if delivery_days is not None and delivery_days <= 1:
-        return "expresso"
-    return "programado"
-
-
-class CepLookupClient:
-    def __init__(self, base_url: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json", "User-Agent": "CalculadoraFretes/1.0"})
-
-    def lookup(self, postal_code: str) -> dict[str, str]:
-        url = f"{self.base_url}/{postal_code}/json/"
-        try:
-            response = self.session.get(url, timeout=15)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise HTTPException(status_code=502, detail=f"Falha ao consultar CEP: {exc}") from exc
-
-        data = response.json()
-        if data.get("erro"):
-            raise HTTPException(status_code=422, detail="CEP de destino não encontrado.")
-        city = str(data.get("localidade") or "").strip()
-        uf = str(data.get("uf") or "").strip()
-        if not city or not uf:
-            raise HTTPException(status_code=422, detail="CEP sem cidade/UF válidos.")
-        return {"city": city, "uf": uf}
-
-
-class MelhorEnvioClient:
-    def __init__(self, token: str, base_url: str, user_agent: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {token}",
-                "User-Agent": user_agent,
-            }
-        )
-
-    def calculate(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
-        url = f"{self.base_url}/api/v2/me/shipment/calculate"
-        try:
-            response = self.session.post(url, json=payload, timeout=30)
-        except requests.Timeout as exc:
-            raise HTTPException(status_code=504, detail="Timeout ao consultar o Melhor Envio.") from exc
-        except requests.RequestException as exc:
-            raise HTTPException(status_code=502, detail=f"Erro de conexão com o Melhor Envio: {exc}") from exc
-
-        if response.status_code == 401:
-            raise HTTPException(status_code=401, detail="Token inválido, expirado ou revogado.")
-        if response.status_code == 403:
-            raise HTTPException(status_code=403, detail="Sem permissão para cotação na API do Melhor Envio.")
-        if response.status_code >= 400:
-            try:
-                detail = response.json()
-            except ValueError:
-                detail = response.text or "Erro desconhecido no Melhor Envio."
-            raise HTTPException(status_code=response.status_code, detail=detail)
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise HTTPException(status_code=502, detail=f"Resposta inválida do Melhor Envio: {response.text[:500]}") from exc
-
-        if not isinstance(data, list):
-            raise HTTPException(status_code=502, detail="Resposta inesperada da API do Melhor Envio.")
-
-        return data
-
-
-class DiskTenhaProvider:
-    def quote(self, destination_city: str, destination_uf: str, volumes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not DISKTENHA_ENABLED:
-            return []
-
-        normalized_city = normalize_text(destination_city)
-
-        if destination_uf.upper() not in {"SC", "PR"}:
-            return [
-                {
-                    "provider": "disktenha",
-                    "provider_label": "Disk&Tenha",
-                    "company_name": "Disk&Tenha",
-                    "service_name": "Tabela Joinville",
-                    "service_type": "expresso",
-                    "price": None,
-                    "delivery_days": None,
-                    "delivery_label": "-",
-                    "error": f"Disk&Tenha não atende a UF {destination_uf.upper()} pela tabela local.",
-                    "metadata": {"city": destination_city, "uf": destination_uf},
-                }
-            ]
-
-        matched_rule = DISKTENHA_TABLE.get(normalized_city)
-        if matched_rule is None and normalized_city == "FLORIANOPOLIS":
-            matched_rule = DISKTENHA_TABLE.get("FLORIANOPOLIS")
-
-        if matched_rule is None:
-            return [
-                {
-                    "provider": "disktenha",
-                    "provider_label": "Disk&Tenha",
-                    "company_name": "Disk&Tenha",
-                    "service_name": "Tabela Joinville",
-                    "service_type": "expresso",
-                    "price": None,
-                    "delivery_days": None,
-                    "delivery_label": "-",
-                    "error": f"Cidade {destination_city}/{destination_uf} não encontrada na tabela da Disk&Tenha.",
-                    "metadata": {"city": destination_city, "uf": destination_uf},
-                }
-            ]
-
-        actual_weight = get_total_actual_weight(volumes)
-        cubic_weight = get_total_cubic_weight(volumes, DISKTENHA_CUBIC_DIVISOR)
-        chargeable_weight = max(actual_weight, cubic_weight)
-        price = float(matched_rule["price"])
-
-        if chargeable_weight > 50:
-            price += chargeable_weight - 50
-
-        voluminous = is_voluminous_load(volumes, actual_weight)
-        if voluminous:
-            price += DISKTENHA_VOLUMINOUS_FEE
-
-        delivery_text = str(matched_rule["delivery_text"])
-        delivery_days = 1 if "PROXIMO DIA UTIL" in normalize_text(delivery_text) else None
-
-        return [
-            {
-                "provider": "disktenha",
-                "provider_label": "Disk&Tenha",
-                "company_name": "Disk&Tenha",
-                "service_name": "Tabela Joinville",
-                "service_type": classify_service(delivery_text, delivery_days),
-                "price": round(price, 2),
-                "delivery_days": delivery_days,
-                "delivery_label": delivery_text,
-                "error": None,
-                "metadata": {
-                    "city": destination_city,
-                    "uf": destination_uf,
-                    "partner": matched_rule.get("partner"),
-                    "actual_weight": actual_weight,
-                    "cubic_weight": cubic_weight,
-                    "chargeable_weight": round(chargeable_weight, 3),
-                    "voluminous_fee_applied": voluminous,
-                },
-            }
-        ]
-
-
-def normalize_melhor_envio_result(item: dict[str, Any]) -> dict[str, Any]:
-    company = item.get("company") or {}
-    days = parse_delivery_days(item)
-    return {
-        "provider": "melhor_envio",
-        "provider_label": "Melhor Envio",
-        "company_name": company.get("name") or "Melhor Envio",
-        "service_name": item.get("name"),
-        "service_type": classify_service(item.get("name", ""), days),
-        "price": parse_price(item),
-        "delivery_days": days,
-        "delivery_label": delivery_days_to_label(days),
-        "error": item.get("error"),
-        "metadata": item,
-    }
-
-
-def provider_error_result(provider: str, provider_label: str, detail: Any) -> dict[str, Any]:
-    message = detail if isinstance(detail, str) else str(detail)
-    return {
-        "provider": provider,
-        "provider_label": provider_label,
-        "company_name": provider_label,
-        "service_name": "-",
-        "service_type": "-",
-        "price": None,
-        "delivery_days": None,
-        "delivery_label": "-",
-        "error": message,
-        "metadata": {},
-    }
 
 
 @app.exception_handler(HTTPException)
@@ -1497,18 +1549,11 @@ def health() -> dict[str, Any]:
         "config_errors": config_errors,
         "base_url": MELHOR_ENVIO_BASE_URL,
         "default_from_postal_code": format_cep(DEFAULT_FROM_POSTAL_CODE),
-        "default_from_city": DEFAULT_FROM_CITY,
         "token_configured": bool(MELHOR_ENVIO_TOKEN.strip()),
         "user_agent_configured": bool(MELHOR_ENVIO_USER_AGENT.strip()),
         "disktenha_enabled": DISKTENHA_ENABLED,
-        "disktenha_cubic_divisor": DISKTENHA_CUBIC_DIVISOR,
         "disktenha_cities_loaded": len(DISKTENHA_TABLE),
     }
-
-
-@app.get("/api/boxes")
-def get_boxes() -> dict[str, Any]:
-    return {"boxes": BOXES}
 
 
 @app.post("/api/quote")
@@ -1522,6 +1567,7 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
     destination = cep_client.lookup(req.to_postal_code)
 
     all_options: list[dict[str, Any]] = []
+    melhor_envio_raw: list[dict[str, Any]] = []
 
     try:
         melhor_envio_payload = build_melhor_envio_payload(req, volumes)
@@ -1536,15 +1582,24 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
         all_options.append(provider_error_result("melhor_envio", "Melhor Envio", exc.detail))
 
     disktenha_provider = DiskTenhaProvider()
-    all_options.extend(disktenha_provider.quote(destination["city"], destination["uf"], volumes))
+    disktenha_results = disktenha_provider.quote(destination["city"], destination["uf"], volumes)
+    all_options.extend(disktenha_results)
 
     available = [item for item in all_options if not item["error"] and item["price"] is not None]
     unavailable = [item for item in all_options if item["error"] or item["price"] is None]
 
     available.sort(key=lambda item: (float(item["price"]), item["delivery_days"] if item["delivery_days"] is not None else 999999))
     all_options_sorted = available + unavailable
+
     best_option = available[0] if available else None
     total_volumes = sum(int(volume["quantity"]) for volume in volumes)
+
+    disktenha_table_city = None
+    for item in disktenha_results:
+        metadata = item.get("metadata") or {}
+        if metadata.get("table_city_used"):
+            disktenha_table_city = metadata.get("table_city_used")
+            break
 
     return {
         "input": {
@@ -1555,6 +1610,7 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
             "custom_volumes": [item.model_dump() for item in req.custom_volumes],
             "destination_city": destination["city"],
             "destination_uf": destination["uf"],
+            "disktenha_table_city": disktenha_table_city,
         },
         "total_volumes": total_volumes,
         "best_option": best_option,
@@ -1565,6 +1621,7 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
             "actual_weight": get_total_actual_weight(volumes),
             "cubic_weight": get_total_cubic_weight(volumes, DISKTENHA_CUBIC_DIVISOR),
             "disktenha_cubic_divisor": DISKTENHA_CUBIC_DIVISOR,
+            "melhor_envio_raw": melhor_envio_raw,
         },
     }
 
