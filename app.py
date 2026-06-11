@@ -153,6 +153,29 @@ def parse_price(item: dict[str, Any]) -> float | None:
 
 
 def parse_delivery_days(item: dict[str, Any]) -> int | None:
+    """
+    Usa o mínimo do range de entrega (custom_delivery_range.min ou delivery_range.min).
+    O painel oficial do Melhor Envio exibe o mínimo; usar o máximo causava +1 dia em todos.
+    """
+    # Tenta o range customizado primeiro
+    custom_range = item.get("custom_delivery_range") or {}
+    range_min = custom_range.get("min")
+    if range_min not in (None, ""):
+        try:
+            return int(range_min)
+        except (TypeError, ValueError):
+            pass
+
+    # Fallback para o range padrão
+    std_range = item.get("delivery_range") or {}
+    range_min = std_range.get("min")
+    if range_min not in (None, ""):
+        try:
+            return int(range_min)
+        except (TypeError, ValueError):
+            pass
+
+    # Último fallback: custom_delivery_time / delivery_time (que é o máximo)
     raw = item.get("custom_delivery_time")
     if raw in (None, ""):
         raw = item.get("delivery_time")
@@ -662,12 +685,41 @@ class ExpressoSaoMiguelClient:
         }
 
 
-def normalize_melhor_envio_result(item: dict[str, Any]) -> dict[str, Any]:
+# Taxa de Ad Valorem / GRIS por transportadora (% sobre o valor da NF).
+# Valores calibrados comparando a API do Melhor Envio com o painel oficial (NF R$1.350).
+# Chave = company_id da API. Valor = taxa decimal (ex: 0.0067 = 0,67%).
+AD_VALOREM_BY_COMPANY: dict[int, float] = {
+    1:  0.0025,   # Correios   — média PAC 0,21% / SEDEX 0,48% → usando 0,25% como base
+    2:  0.0030,   # Jadlog     — .Package 0,23% / .Com 0,33% → usando 0,30%
+    6:  0.0067,   # LATAM Cargo— éFácil 0,67%
+    8:  0.0030,   # Total Express Standard 0,30%
+    9:  0.0030,   # Azul Cargo — e-commerce 0,19% / Expresso 0,40% → usando 0,30%
+    14: 0.0030,   # Loggi      — sem dado direto, usando 0,30% como conservador
+    15: 0.0020,   # JeT        — Standard 0,19%
+    12: 0.0025,   # Buslog     — sem dado direto, usando 0,25%
+}
+AD_VALOREM_DEFAULT = 0.0035  # fallback para transportadoras não mapeadas
+
+
+def apply_ad_valorem(base_price: float, insurance_value: float, company_id: int | None) -> float:
+    """Soma o Ad Valorem ao preço base. Retorna preço ajustado."""
+    if insurance_value <= 0 or base_price <= 0:
+        return base_price
+    rate = AD_VALOREM_BY_COMPANY.get(company_id, AD_VALOREM_DEFAULT) if company_id else AD_VALOREM_DEFAULT
+    return round(base_price + insurance_value * rate, 2)
+
+
+def normalize_melhor_envio_result(item: dict[str, Any], insurance_value: float = 0.0) -> dict[str, Any]:
     company = item.get("company") or {}
     company_name = company.get("name") or "Melhor Envio"
+    company_id = company.get("id")
     service_name = item.get("name") or "-"
     days = parse_delivery_days(item)
     price = parse_price(item)
+
+    # Aplica Ad Valorem por transportadora para chegar ao preço real cobrado
+    if price is not None and not item.get("error"):
+        price = apply_ad_valorem(price, insurance_value, company_id)
 
     return {
         "provider": "melhor_envio",
@@ -1779,7 +1831,7 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
             user_agent=MELHOR_ENVIO_USER_AGENT,
         )
         melhor_envio_raw = melhor_envio_client.calculate(melhor_envio_payload)
-        all_options.extend(normalize_melhor_envio_result(item) for item in melhor_envio_raw)
+        all_options.extend(normalize_melhor_envio_result(item, req.insurance_value) for item in melhor_envio_raw)
     except HTTPException as exc:
         all_options.append(provider_error_result("melhor_envio", "Melhor Envio", exc.detail))
 
