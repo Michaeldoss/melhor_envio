@@ -1305,6 +1305,28 @@ HTML_PAGE = """
               <tbody id="results-body"></tbody>
             </table>
           </div>
+
+          <!-- Painel de debug: JSON bruto do Melhor Envio -->
+          <div id="debug-panel" style="margin-top:20px; display:none;">
+            <details>
+              <summary style="cursor:pointer; font-size:13px; color:var(--muted); font-weight:700; padding:8px 0;">
+                🔍 JSON bruto — Melhor Envio (debug)
+              </summary>
+              <pre id="debug-json" style="
+                margin-top:8px;
+                background:#f0f4f8;
+                border:1px solid var(--border);
+                border-radius:10px;
+                padding:14px;
+                font-size:11px;
+                overflow-x:auto;
+                white-space:pre-wrap;
+                word-break:break-all;
+                max-height:400px;
+                overflow-y:auto;
+              "></pre>
+            </details>
+          </div>
         </div>
       </div>
     </div>
@@ -1666,6 +1688,14 @@ HTML_PAGE = """
           uf: data.input?.destination_uf || "-",
           disktenha_table_city: data.input?.disktenha_table_city || null
         };
+
+        // Painel de debug: mostra JSON bruto do Melhor Envio
+        const debugPanel = document.getElementById("debug-panel");
+        const debugJson = document.getElementById("debug-json");
+        if (data.debug?.melhor_envio_raw) {
+          debugJson.textContent = JSON.stringify(data.debug.melhor_envio_raw, null, 2);
+          debugPanel.style.display = "block";
+        }
 
         applySortingAndRender();
 
