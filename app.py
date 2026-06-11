@@ -229,6 +229,7 @@ class QuoteRequest(BaseModel):
     from_postal_code: str
     to_postal_code: str
     insurance_value: float = Field(default=0.0, ge=0)
+    recipient_doc: str = Field(default="", description="CNPJ ou CPF do destinatário (para Expresso São Miguel)")
     standard_boxes: list[StandardBoxRequest] = Field(default_factory=list)
     custom_volumes: list[CustomVolumeRequest] = Field(default_factory=list)
     receipt: bool = False
@@ -242,6 +243,16 @@ class QuoteRequest(BaseModel):
         if len(digits) != 8:
             raise ValueError("CEP deve conter 8 dígitos.")
         return digits
+
+    @field_validator("recipient_doc")
+    @classmethod
+    def validate_recipient_doc(cls, value: str) -> str:
+        if not value:
+            return ""
+        d = digits_only(value)
+        if d and len(d) not in (11, 14):
+            raise ValueError("CNPJ/CPF deve ter 11 (CPF) ou 14 (CNPJ) dígitos.")
+        return d
 
     @field_validator("insurance_value")
     @classmethod
@@ -539,6 +550,7 @@ class ExpressoSaoMiguelClient:
         total_cubagem_m3: float,
         insurance_value: float,
         total_volumes: int,
+        recipient_doc: str = "",
     ) -> dict[str, Any]:
         if not self.access_key or not self.customer:
             raise HTTPException(
@@ -556,6 +568,10 @@ class ExpressoSaoMiguelClient:
             "VERSION": "2",
         }
 
+        # Usa o doc informado ou placeholder; determina tipo pela quantidade de dígitos
+        doc = digits_only(recipient_doc) if recipient_doc else "00000000000"
+        tipo_pessoa = "J" if len(doc) == 14 else "F"
+
         payload = {
             "tipoPagoPagar": "P",
             "codigoCidadeDestino": int(ibge_code),
@@ -563,9 +579,9 @@ class ExpressoSaoMiguelClient:
             "pesoMercadoria": round(total_weight, 3),
             "cubagemMercadoria": round(total_cubagem_m3, 6),
             "valorMercadoria": round(max(insurance_value, 1.0), 2),
-            "clienteDestino": "00000000000",  # CPF placeholder para cotação
+            "clienteDestino": doc,
             "dataEmbarque": today,
-            "tipoPessoaDestino": "F",
+            "tipoPessoaDestino": tipo_pessoa,
         }
 
         try:
@@ -1154,6 +1170,12 @@ HTML_PAGE = """
             <input id="insurance_value" name="insurance_value" type="number" step="0.01" min="0" value="0" />
           </div>
 
+          <div class="field">
+            <label for="recipient_doc">CNPJ / CPF do destinatário</label>
+            <input id="recipient_doc" name="recipient_doc" type="text" maxlength="18" placeholder="00.000.000/0000-00 ou 000.000.000-00" />
+            <span class="hint">Obrigatório para cotação Expresso São Miguel. Deixe em branco para usar placeholder.</span>
+          </div>
+
           <div class="summary-box">
             Preencha a quantidade e o peso unitário das caixas padrão. Se houver outro tamanho, use o botão <strong>Adicionar volume</strong>.
           </div>
@@ -1516,6 +1538,7 @@ HTML_PAGE = """
       document.getElementById("from_postal_code").value = "{{FROM_POSTAL_CODE_FORMATTED}}";
       document.getElementById("to_postal_code").value = "";
       document.getElementById("insurance_value").value = "0";
+      document.getElementById("recipient_doc").value = "";
       document.getElementById("box1_quantity").value = "0";
       document.getElementById("box1_weight").value = "0";
       document.getElementById("box2_quantity").value = "0";
@@ -1595,6 +1618,7 @@ HTML_PAGE = """
         from_postal_code: onlyDigits(document.getElementById("from_postal_code").value),
         to_postal_code: onlyDigits(document.getElementById("to_postal_code").value),
         insurance_value: Number(document.getElementById("insurance_value").value || 0),
+        recipient_doc: onlyDigits(document.getElementById("recipient_doc").value || ""),
         standard_boxes,
         custom_volumes
       };
@@ -1748,6 +1772,7 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
                 total_cubagem_m3=total_cubagem_m3,
                 insurance_value=req.insurance_value,
                 total_volumes=len(volumes),
+                recipient_doc=req.recipient_doc,
             )
             all_options.append(esm_client.normalize_result(esm_raw))
         except HTTPException as exc:
