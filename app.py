@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unicodedata
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -29,6 +30,15 @@ VIACEP_BASE_URL = os.getenv("VIACEP_BASE_URL", "https://viacep.com.br/ws")
 DISKTENHA_ENABLED = os.getenv("DISKTENHA_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 DISKTENHA_CUBIC_DIVISOR = float(os.getenv("DISKTENHA_CUBIC_DIVISOR", "6000"))
 DISKTENHA_VOLUMINOUS_FEE = float(os.getenv("DISKTENHA_VOLUMINOUS_FEE", "3.0"))
+
+# Expresso São Miguel — cotação direta via API contratual
+EXPRESSO_SM_ENABLED = os.getenv("EXPRESSO_SM_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+EXPRESSO_SM_BASE_URL = os.getenv(
+    "EXPRESSO_SM_BASE_URL",
+    "https://wsintegcli01.expressosaomiguel.com.br:40504",
+)
+EXPRESSO_SM_ACCESS_KEY = os.getenv("EXPRESSO_SM_ACCESS_KEY", "")
+EXPRESSO_SM_CUSTOMER = os.getenv("EXPRESSO_SM_CUSTOMER", "")
 
 BOXES: dict[str, dict[str, float | str]] = {
     "1": {"label": "Caixa 1", "width": 26.0, "height": 19.0, "length": 36.0},
@@ -257,44 +267,46 @@ class QuoteRequest(BaseModel):
 
 
 def build_volumes(req: QuoteRequest) -> list[dict[str, Any]]:
+    """
+    Expande cada caixa/volume em N entradas individuais (sem campo quantity).
+    O Melhor Envio não documenta suporte a 'quantity' por volume — expandir
+    é mais seguro e garante cálculo correto de peso e seguro.
+    O insurance_value fica em 0 aqui; vai para options.insurance_value no payload.
+    """
     volumes: list[dict[str, Any]] = []
 
     for item in req.standard_boxes:
         if item.quantity <= 0:
             continue
         box = BOXES[item.box_type]
-        volumes.append(
-            {
-                "source": f"Caixa {item.box_type}",
-                "width": float(box["width"]),
-                "height": float(box["height"]),
-                "length": float(box["length"]),
-                "weight": item.weight,
-                "quantity": item.quantity,
-                "insurance_value": 0.0,
-            }
-        )
+        for _ in range(item.quantity):
+            volumes.append(
+                {
+                    "source": f"Caixa {item.box_type}",
+                    "width": float(box["width"]),
+                    "height": float(box["height"]),
+                    "length": float(box["length"]),
+                    "weight": item.weight,
+                    # quantity não é enviado — cada entry já é 1 unidade
+                    "insurance_value": 0.0,
+                }
+            )
 
     for index, item in enumerate(req.custom_volumes, start=1):
-        volumes.append(
-            {
-                "source": f"Volume adicional {index}",
-                "width": item.width,
-                "height": item.height,
-                "length": item.length,
-                "weight": item.weight,
-                "quantity": item.quantity,
-                "insurance_value": 0.0,
-            }
-        )
+        for _ in range(item.quantity):
+            volumes.append(
+                {
+                    "source": f"Volume adicional {index}",
+                    "width": item.width,
+                    "height": item.height,
+                    "length": item.length,
+                    "weight": item.weight,
+                    "insurance_value": 0.0,
+                }
+            )
 
-    total_units = sum(int(v["quantity"]) for v in volumes)
-    if total_units <= 0:
+    if not volumes:
         raise HTTPException(status_code=422, detail="Nenhum volume válido informado.")
-
-    insurance_per_unit = round(req.insurance_value / total_units, 2) if req.insurance_value > 0 else 0.0
-    for volume in volumes:
-        volume["insurance_value"] = insurance_per_unit
 
     return volumes
 
@@ -309,12 +321,12 @@ def build_melhor_envio_payload(req: QuoteRequest, volumes: list[dict[str, Any]])
                 "height": volume["height"],
                 "length": volume["length"],
                 "weight": volume["weight"],
-                "insurance_value": volume["insurance_value"],
-                "quantity": volume["quantity"],
+                # insurance_value NÃO vai aqui — vai em options como total
             }
             for volume in volumes
         ],
         "options": {
+            "insurance_value": req.insurance_value,  # valor total, não distribuído
             "receipt": req.receipt,
             "own_hand": req.own_hand,
             "collect": req.collect,
@@ -323,14 +335,15 @@ def build_melhor_envio_payload(req: QuoteRequest, volumes: list[dict[str, Any]])
 
 
 def get_total_actual_weight(volumes: list[dict[str, Any]]) -> float:
-    return round(sum(float(v["weight"]) * int(v["quantity"]) for v in volumes), 3)
+    # Cada entry no array já é 1 unidade (quantidade foi expandida no build_volumes)
+    return round(sum(float(v["weight"]) for v in volumes), 3)
 
 
 def get_total_cubic_weight(volumes: list[dict[str, Any]], cubic_divisor: float) -> float:
     total = 0.0
     for volume in volumes:
         cubic_cm = float(volume["width"]) * float(volume["height"]) * float(volume["length"])
-        total += (cubic_cm / cubic_divisor) * int(volume["quantity"])
+        total += cubic_cm / cubic_divisor
     return round(total, 3)
 
 
@@ -363,9 +376,10 @@ class CepLookupClient:
 
         city = str(data.get("localidade") or "").strip()
         uf = str(data.get("uf") or "").strip()
+        ibge = str(data.get("ibge") or "").strip()  # código IBGE do município
         if not city or not uf:
             raise HTTPException(status_code=422, detail="CEP sem cidade/UF válidos.")
-        return {"city": city, "uf": uf}
+        return {"city": city, "uf": uf, "ibge": ibge}
 
 
 class MelhorEnvioClient:
@@ -496,6 +510,140 @@ class DiskTenhaProvider:
                 },
             }
         ]
+
+
+def get_total_cubagem_m3(volumes: list[dict[str, Any]]) -> float:
+    """Soma do volume de todos os pacotes em m³ (cm³ / 1_000_000)."""
+    total = 0.0
+    for v in volumes:
+        total += float(v["width"]) * float(v["height"]) * float(v["length"]) / 1_000_000
+    return round(total, 6)
+
+
+class ExpressoSaoMiguelClient:
+    """
+    Integração com a API de cotação da Expresso São Miguel.
+    Endpoint: POST /wsservernet/rest/frete/buscar/cliente
+    """
+
+    def __init__(self, base_url: str, access_key: str, customer: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.access_key = access_key
+        self.customer = customer
+        self.session = requests.Session()
+
+    def calculate(
+        self,
+        ibge_code: str,
+        total_weight: float,
+        total_cubagem_m3: float,
+        insurance_value: float,
+        total_volumes: int,
+    ) -> dict[str, Any]:
+        if not self.access_key or not self.customer:
+            raise HTTPException(
+                status_code=500,
+                detail="EXPRESSO_SM_ACCESS_KEY e EXPRESSO_SM_CUSTOMER não configurados.",
+            )
+
+        url = f"{self.base_url}/wsservernet/rest/frete/buscar/cliente"
+        today = datetime.now().strftime("%d/%m/%Y")
+
+        headers = {
+            "Content-Type": "application/json",
+            "ACCESS_KEY": self.access_key,
+            "CUSTOMER": self.customer,
+            "VERSION": "2",
+        }
+
+        payload = {
+            "tipoPagoPagar": "P",
+            "codigoCidadeDestino": int(ibge_code),
+            "quantidadeMercadoria": max(1, total_volumes),
+            "pesoMercadoria": round(total_weight, 3),
+            "cubagemMercadoria": round(total_cubagem_m3, 6),
+            "valorMercadoria": round(max(insurance_value, 1.0), 2),
+            "clienteDestino": "00000000000",  # CPF placeholder para cotação
+            "dataEmbarque": today,
+            "tipoPessoaDestino": "F",
+        }
+
+        try:
+            response = self.session.post(url, json=payload, headers=headers, timeout=20)
+        except requests.Timeout as exc:
+            raise HTTPException(status_code=504, detail="Timeout ao consultar Expresso São Miguel.") from exc
+        except requests.RequestException as exc:
+            raise HTTPException(status_code=502, detail=f"Erro de conexão com Expresso São Miguel: {exc}") from exc
+
+        if response.status_code == 401:
+            raise HTTPException(status_code=401, detail="ACCESS_KEY inválida ou limite excedido na Expresso São Miguel.")
+        if response.status_code >= 400:
+            raise HTTPException(
+                status_code=response.status_code,
+                detail=f"Erro Expresso São Miguel ({response.status_code}): {response.text[:300]}",
+            )
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail=f"Resposta inválida da Expresso São Miguel: {response.text[:300]}") from exc
+
+        return data
+
+    def normalize_result(self, data: dict[str, Any]) -> dict[str, Any]:
+        status = str(data.get("status") or "").lower()
+        if status != "ok":
+            error_msg = data.get("mensagem") or f"Status inesperado: {status}"
+            return {
+                "provider": "expresso_sm",
+                "provider_label": "Expresso São Miguel",
+                "company_name": "Expresso São Miguel",
+                "service_name": "Rodoviário",
+                "service_type": "programado",
+                "price": None,
+                "delivery_days": None,
+                "delivery_label": "-",
+                "error": error_msg,
+                "metadata": data,
+            }
+
+        price = None
+        raw_price = data.get("valorFrete")
+        try:
+            price = float(raw_price) if raw_price not in (None, "") else None
+        except (TypeError, ValueError):
+            pass
+
+        # Calcular dias úteis a partir das datas de previsão
+        delivery_days: int | None = None
+        delivery_label = "-"
+        prev_entrega = data.get("previsaoEntrega") or ""
+        prev_embarque = data.get("previsaoEmbarque") or ""
+
+        if prev_entrega and prev_embarque:
+            try:
+                fmt = "%d/%m/%Y"
+                d_embarque = datetime.strptime(prev_embarque.strip()[:10], fmt)
+                # previsaoEntrega pode vir com hora: "06/09/2018 15:00"
+                d_entrega = datetime.strptime(prev_entrega.strip()[:10], fmt)
+                delta = (d_entrega - d_embarque).days
+                delivery_days = max(1, delta)
+                delivery_label = data.get("informacaoEntrega") or f"{delivery_days} dia(s)"
+            except (ValueError, TypeError):
+                delivery_label = data.get("informacaoEntrega") or prev_entrega
+
+        return {
+            "provider": "expresso_sm",
+            "provider_label": "Expresso São Miguel",
+            "company_name": "Expresso São Miguel",
+            "service_name": "Rodoviário",
+            "service_type": classify_service("Rodoviário", "Expresso São Miguel", "", delivery_days),
+            "price": round(price, 2) if price is not None else None,
+            "delivery_days": delivery_days,
+            "delivery_label": delivery_label,
+            "error": None,
+            "metadata": data,
+        }
 
 
 def normalize_melhor_envio_result(item: dict[str, Any]) -> dict[str, Any]:
@@ -1585,6 +1733,26 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
     disktenha_results = disktenha_provider.quote(destination["city"], destination["uf"], volumes)
     all_options.extend(disktenha_results)
 
+    # Expresso São Miguel — cotação direta via API contratual
+    if EXPRESSO_SM_ENABLED and destination.get("ibge"):
+        try:
+            esm_client = ExpressoSaoMiguelClient(
+                base_url=EXPRESSO_SM_BASE_URL,
+                access_key=EXPRESSO_SM_ACCESS_KEY,
+                customer=EXPRESSO_SM_CUSTOMER,
+            )
+            total_cubagem_m3 = get_total_cubagem_m3(volumes)
+            esm_raw = esm_client.calculate(
+                ibge_code=destination["ibge"],
+                total_weight=get_total_actual_weight(volumes),
+                total_cubagem_m3=total_cubagem_m3,
+                insurance_value=req.insurance_value,
+                total_volumes=len(volumes),
+            )
+            all_options.append(esm_client.normalize_result(esm_raw))
+        except HTTPException as exc:
+            all_options.append(provider_error_result("expresso_sm", "Expresso São Miguel", exc.detail))
+
     available = [item for item in all_options if not item["error"] and item["price"] is not None]
     unavailable = [item for item in all_options if item["error"] or item["price"] is None]
 
@@ -1592,7 +1760,7 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
     all_options_sorted = available + unavailable
 
     best_option = available[0] if available else None
-    total_volumes = sum(int(volume["quantity"]) for volume in volumes)
+    total_volumes = len(volumes)  # cada entry já é 1 unidade (expandido em build_volumes)
 
     disktenha_table_city = None
     for item in disktenha_results:
@@ -1610,6 +1778,7 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
             "custom_volumes": [item.model_dump() for item in req.custom_volumes],
             "destination_city": destination["city"],
             "destination_uf": destination["uf"],
+            "destination_ibge": destination.get("ibge", ""),
             "disktenha_table_city": disktenha_table_city,
         },
         "total_volumes": total_volumes,
