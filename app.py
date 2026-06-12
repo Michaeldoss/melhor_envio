@@ -723,7 +723,6 @@ class SswClient:
       <peso xsi:type="xsd:decimal">{peso}</peso>
       <volume xsi:type="xsd:decimal">{volume}</volume>
       <mercadoria xsi:type="xsd:integer">1</mercadoria>
-      <cnpjRemetente xsi:type="xsd:string">{cnpj_pagador}</cnpjRemetente>
     </ns1:cotar>
   </SOAP-ENV:Body>
 </SOAP-ENV:Envelope>"""
@@ -2062,26 +2061,32 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
 
     # Arlete Transportes via SSW SOAP
     if SSW_ENABLED:
-        try:
-            ssw_client = SswClient(
-                endpoint=SSW_ENDPOINT,
-                dominio=SSW_DOMINIO,
-                login=SSW_LOGIN,
-                senha=SSW_SENHA,
-                cnpj_pagador=SSW_CNPJ_PAGADOR,
-            )
-            ssw_cubagem = get_total_cubagem_m3(volumes)
-            ssw_raw = ssw_client.calculate(
-                cep_origem=req.from_postal_code,
-                cep_destino=req.to_postal_code,
-                valor_nf=req.insurance_value,
-                quantidade=len(volumes),
-                peso=get_total_actual_weight(volumes),
-                volume_m3=ssw_cubagem,
-            )
-            all_options.append(ssw_client.normalize_result(ssw_raw))
-        except HTTPException as exc:
-            all_options.append(provider_error_result("ssw_arlete", "Arlete Transportes", exc.detail))
+        if not req.recipient_doc:
+            all_options.append(provider_error_result(
+                "ssw_arlete", "Arlete Transportes",
+                "Informe o CNPJ do destinatário para cotar Arlete Transportes."
+            ))
+        else:
+            try:
+                ssw_client = SswClient(
+                    endpoint=SSW_ENDPOINT,
+                    dominio=SSW_DOMINIO,
+                    login=SSW_LOGIN,
+                    senha=SSW_SENHA,
+                    cnpj_pagador=digits_only(req.recipient_doc),  # destinatário paga = CIF válido
+                )
+                ssw_cubagem = get_total_cubagem_m3(volumes)
+                ssw_raw = ssw_client.calculate(
+                    cep_origem=req.from_postal_code,
+                    cep_destino=req.to_postal_code,
+                    valor_nf=req.insurance_value,
+                    quantidade=len(volumes),
+                    peso=get_total_actual_weight(volumes),
+                    volume_m3=ssw_cubagem,
+                )
+                all_options.append(ssw_client.normalize_result(ssw_raw))
+            except HTTPException as exc:
+                all_options.append(provider_error_result("ssw_arlete", "Arlete Transportes", exc.detail))
 
     available = [item for item in all_options if not item["error"] and item["price"] is not None]
     unavailable = [item for item in all_options if item["error"] or item["price"] is None]
