@@ -40,6 +40,14 @@ EXPRESSO_SM_BASE_URL = os.getenv(
 EXPRESSO_SM_ACCESS_KEY = os.getenv("EXPRESSO_SM_ACCESS_KEY", "")
 EXPRESSO_SM_CUSTOMER = os.getenv("EXPRESSO_SM_CUSTOMER", "")
 
+# Arlete Transportes via SSW Webservice de Cotação
+SSW_ENABLED = os.getenv("SSW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+SSW_ENDPOINT = os.getenv("SSW_ENDPOINT", "https://ssw.inf.br/ws/sswCotacao/index.php")
+SSW_DOMINIO = os.getenv("SSW_DOMINIO", "ARL")
+SSW_LOGIN = os.getenv("SSW_LOGIN", "45024640")
+SSW_SENHA = os.getenv("SSW_SENHA", "dgt71649")
+SSW_CNPJ_PAGADOR = os.getenv("SSW_CNPJ_PAGADOR", "40045152000125")  # DOSS Group
+
 BOXES: dict[str, dict[str, float | str]] = {
     "1": {"label": "Caixa 1", "width": 26.0, "height": 19.0, "length": 36.0},
     "2": {"label": "Caixa 2", "width": 18.0, "height": 18.0, "length": 27.0},
@@ -681,6 +689,198 @@ class ExpressoSaoMiguelClient:
             "delivery_days": delivery_days,
             "delivery_label": delivery_label,
             "error": None,
+            "metadata": data,
+        }
+
+
+class SswClient:
+    """
+    Cliente para o Webservice SOAP de Cotação SSW (Arlete Transportes).
+    Usa SOAP RPC/encoded sem zeep — constrói o envelope manualmente.
+    Retorna preço TOTAL já com todas as taxas (GRIS, pedágio, etc.).
+    ATENÇÃO: prazo retornado é em DIAS CORRIDOS, não úteis.
+    """
+
+    SOAP_ENVELOPE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-ENV:Envelope
+    xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/"
+    xmlns:ns1="urn:sswinfbr.sswCotacao"
+    xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xmlns:SOAP-ENC="http://schemas.xmlsoap.org/soap/encoding/"
+    SOAP-ENV:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+  <SOAP-ENV:Body>
+    <ns1:cotar>
+      <dominio xsi:type="xsd:string">{dominio}</dominio>
+      <login xsi:type="xsd:string">{login}</login>
+      <senha xsi:type="xsd:string">{senha}</senha>
+      <cnpjPagador xsi:type="xsd:string">{cnpj_pagador}</cnpjPagador>
+      <cepOrigem xsi:type="xsd:integer">{cep_origem}</cepOrigem>
+      <cepDestino xsi:type="xsd:integer">{cep_destino}</cepDestino>
+      <valorNF xsi:type="xsd:decimal">{valor_nf}</valorNF>
+      <quantidade xsi:type="xsd:integer">{quantidade}</quantidade>
+      <peso xsi:type="xsd:decimal">{peso}</peso>
+      <volume xsi:type="xsd:decimal">{volume}</volume>
+      <mercadoria xsi:type="xsd:integer">1</mercadoria>
+      <cnpjRemetente xsi:type="xsd:string">{cnpj_pagador}</cnpjRemetente>
+    </ns1:cotar>
+  </SOAP-ENV:Body>
+</SOAP-ENV:Envelope>"""
+
+    def __init__(self, endpoint: str, dominio: str, login: str, senha: str, cnpj_pagador: str) -> None:
+        self.endpoint = endpoint
+        self.dominio = dominio
+        self.login = login
+        self.senha = senha
+        self.cnpj_pagador = cnpj_pagador
+        self.session = requests.Session()
+
+    def calculate(
+        self,
+        cep_origem: str,
+        cep_destino: str,
+        valor_nf: float,
+        quantidade: int,
+        peso: float,
+        volume_m3: float,
+    ) -> dict[str, Any]:
+        envelope = self.SOAP_ENVELOPE.format(
+            dominio=self.dominio,
+            login=self.login,
+            senha=self.senha,
+            cnpj_pagador=self.cnpj_pagador,
+            cep_origem=int(cep_origem),
+            cep_destino=int(cep_destino),
+            valor_nf=round(max(valor_nf, 1.0), 2),
+            quantidade=max(1, quantidade),
+            peso=round(peso, 3),
+            volume=round(volume_m3, 4),
+        )
+
+        headers = {
+            "Content-Type": "text/xml; charset=UTF-8",
+            "SOAPAction": "urn:sswinfbr.sswCotacao#cotacao",
+        }
+
+        try:
+            resp = self.session.post(self.endpoint, data=envelope.encode("utf-8"), headers=headers, timeout=20)
+        except requests.Timeout as exc:
+            raise HTTPException(504, "Timeout SSW/Arlete.") from exc
+        except requests.RequestException as exc:
+            raise HTTPException(502, f"Erro conexão SSW/Arlete: {exc}") from exc
+
+        if resp.status_code >= 400:
+            raise HTTPException(resp.status_code, f"SSW HTTP {resp.status_code}: {resp.text[:200]}")
+
+        return self._parse_soap_response(resp.text)
+
+    @staticmethod
+    def _parse_soap_response(xml_text: str) -> dict[str, Any]:
+        import xml.etree.ElementTree as ET
+
+        try:
+            root = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise HTTPException(502, f"SSW resposta XML inválida: {exc}") from exc
+
+        # O return é uma string XML dentro do envelope SOAP
+        ns = {"SOAP-ENV": "http://schemas.xmlsoap.org/soap/envelope/"}
+        body = root.find("SOAP-ENV:Body", ns)
+        if body is None:
+            body = root.find(".//{http://schemas.xmlsoap.org/soap/envelope/}Body")
+
+        inner_xml: str | None = None
+        if body is not None:
+            for child in body.iter():
+                if child.tag.endswith("}return") or child.tag == "return":
+                    inner_xml = (child.text or "").strip()
+                    break
+
+        if not inner_xml:
+            raise HTTPException(502, "SSW: campo <return> não encontrado na resposta.")
+
+        try:
+            cotacao = ET.fromstring(inner_xml)
+        except ET.ParseError:
+            # Tenta limpar encoding declaration se presente
+            inner_clean = "\n".join(
+                line for line in inner_xml.splitlines()
+                if not line.strip().startswith("<?xml")
+            )
+            try:
+                cotacao = ET.fromstring(inner_clean)
+            except ET.ParseError as exc2:
+                raise HTTPException(502, f"SSW: XML interno inválido: {exc2}") from exc2
+
+        def get(tag: str) -> str:
+            el = cotacao.find(tag)
+            return (el.text or "").strip() if el is not None else ""
+
+        erro = get("erro")
+        mensagem = get("mensagem")
+
+        if erro in ("-2", "-1"):
+            raise HTTPException(422, f"SSW erro {erro}: {mensagem}")
+
+        # erro 0 = sucesso; erro 1 = calculado com ressalvas (ainda válido)
+        total_frete_raw = get("totalFrete")
+        prazo_raw = get("prazo")
+
+        try:
+            total_frete = float(total_frete_raw) if total_frete_raw else None
+        except ValueError:
+            total_frete = None
+
+        try:
+            prazo_corridos = int(prazo_raw) if prazo_raw else None
+        except ValueError:
+            prazo_corridos = None
+
+        return {
+            "erro": erro,
+            "mensagem": mensagem,
+            "totalFrete": total_frete,
+            "prazo_corridos": prazo_corridos,
+            "gris": get("gris"),
+            "pedagio": get("pedagio"),
+            "impostos": get("impostos"),
+            "raw": {tag: get(tag) for tag in [
+                "pesoCalculo", "fretePeso", "freteValor", "despacho",
+                "cat", "itr", "gris", "pedagio", "tas", "impostos",
+                "tabCalculo", "tar",
+            ]},
+        }
+
+    def normalize_result(self, data: dict[str, Any]) -> dict[str, Any]:
+        price = data.get("totalFrete")
+        prazo_corridos = data.get("prazo_corridos")
+        mensagem = data.get("mensagem") or ""
+
+        # Converte dias corridos → aproximação dias úteis (×5/7)
+        delivery_days_approx: int | None = None
+        if prazo_corridos is not None:
+            delivery_days_approx = max(1, round(prazo_corridos * 5 / 7))
+
+        if prazo_corridos is not None:
+            delivery_label = f"~{delivery_days_approx} dia(s) úteis ({prazo_corridos} corridos)"
+        else:
+            delivery_label = "-"
+
+        error_msg = None
+        if data.get("erro") == "1" and mensagem:
+            error_msg = None  # ressalva, mas preço válido — mostra como aviso no metadata
+
+        return {
+            "provider": "ssw_arlete",
+            "provider_label": "Arlete Transportes",
+            "company_name": "Arlete Transportes",
+            "service_name": "Rodoviário",
+            "service_type": classify_service("Rodoviário", "Arlete", "", delivery_days_approx),
+            "price": round(price, 2) if price is not None else None,
+            "delivery_days": delivery_days_approx,
+            "delivery_label": delivery_label,
+            "error": error_msg,
             "metadata": data,
         }
 
@@ -1859,6 +2059,29 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
             all_options.append(esm_client.normalize_result(esm_raw))
         except HTTPException as exc:
             all_options.append(provider_error_result("expresso_sm", "Expresso São Miguel", exc.detail))
+
+    # Arlete Transportes via SSW SOAP
+    if SSW_ENABLED:
+        try:
+            ssw_client = SswClient(
+                endpoint=SSW_ENDPOINT,
+                dominio=SSW_DOMINIO,
+                login=SSW_LOGIN,
+                senha=SSW_SENHA,
+                cnpj_pagador=SSW_CNPJ_PAGADOR,
+            )
+            ssw_cubagem = get_total_cubagem_m3(volumes)
+            ssw_raw = ssw_client.calculate(
+                cep_origem=req.from_postal_code,
+                cep_destino=req.to_postal_code,
+                valor_nf=req.insurance_value,
+                quantidade=len(volumes),
+                peso=get_total_actual_weight(volumes),
+                volume_m3=ssw_cubagem,
+            )
+            all_options.append(ssw_client.normalize_result(ssw_raw))
+        except HTTPException as exc:
+            all_options.append(provider_error_result("ssw_arlete", "Arlete Transportes", exc.detail))
 
     available = [item for item in all_options if not item["error"] and item["price"] is not None]
     unavailable = [item for item in all_options if item["error"] or item["price"] is None]
