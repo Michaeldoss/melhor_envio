@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import html as html_lib
 import unicodedata
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -812,14 +813,42 @@ class SswClient:
             except ET.ParseError as exc2:
                 raise HTTPException(502, f"SSW: XML interno inválido: {exc2}") from exc2
 
+        def decode_ssw_text(text: str) -> str:
+            """
+            O SSW (sistema legado) frequentemente retorna texto com entities
+            HTML mal-escapadas (ex: '&amp;atilde;' em vez de 'ã'), problema
+            documentado no próprio manual deles. Desfaz o duplo-escape e
+            decodifica entities nomeadas (atilde, ccedil, etc.).
+            """
+            if not text:
+                return text
+            # Desfaz "&amp;" duplicado/triplicado até estabilizar
+            previous = None
+            current = text
+            for _ in range(5):
+                if current == previous:
+                    break
+                previous = current
+                current = current.replace("&amp;", "&")
+            # Decodifica entities HTML nomeadas (&atilde; -> ã, &Atilde; -> Ã, etc.)
+            return html_lib.unescape(current)
+
         def get(tag: str) -> str:
             el = cotacao.find(tag)
-            return (el.text or "").strip() if el is not None else ""
+            raw = (el.text or "").strip() if el is not None else ""
+            return decode_ssw_text(raw)
 
         erro = get("erro")
         mensagem = get("mensagem")
 
         if erro in ("-2", "-1"):
+            msg_lower = mensagem.lower()
+            if "tabela de frete negociada" in msg_lower or ("cota" in msg_lower and "permitida" in msg_lower):
+                raise HTTPException(
+                    422,
+                    "Este CNPJ não possui tabela de frete negociada com a Arlete. "
+                    "Cotação só funciona para clientes com contrato já cadastrado.",
+                )
             raise HTTPException(422, f"SSW erro {erro}: {mensagem}")
 
         # erro 0 = sucesso; erro 1 = calculado com ressalvas (ainda válido)
