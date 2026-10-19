@@ -1381,6 +1381,15 @@ HTML_PAGE = """
           </div>
 
           <div class="field">
+            <label for="customer_code">Código do cliente (Uniplus)</label>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input id="customer_code" type="text" inputmode="numeric" maxlength="20" placeholder="Ex.: 2174" style="min-width:0;flex:1" />
+              <button id="customer_lookup" type="button" class="btn-secondary">Buscar</button>
+            </div>
+            <span id="customer_lookup_status" class="hint" role="status">No CRM, informe o código para preencher CEP e CNPJ/CPF.</span>
+          </div>
+
+          <div class="field">
             <label for="insurance_value">Valor da NF / valor declarado (R$)</label>
             <input id="insurance_value" name="insurance_value" type="number" step="0.01" min="0" value="0" />
           </div>
@@ -1548,6 +1557,66 @@ HTML_PAGE = """
   </div>
 
   <script>
+    const CRM_ORIGIN = "https://doss-crm.vercel.app";
+    const customerCode = document.getElementById("customer_code");
+    const customerLookup = document.getElementById("customer_lookup");
+    const customerStatus = document.getElementById("customer_lookup_status");
+    let customerRequest = null;
+    let customerTimer = null;
+    function cancelCustomerLookup() {
+      customerRequest = null;
+      clearTimeout(customerTimer);
+      customerLookup.disabled = false;
+    }
+    function lookupCustomer() {
+      cancelCustomerLookup();
+      // Clear the prior recipient before resolving a different customer.
+      document.getElementById("to_postal_code").value = "";
+      document.getElementById("recipient_doc").value = "";
+      if (!/^[0-9]{1,20}$/.test(customerCode.value.trim())) {
+        customerStatus.textContent = "Informe somente o código numérico do cliente.";
+        return;
+      }
+      if (window.parent === window) {
+        customerStatus.textContent = "Abra Fretes dentro do CRM para consultar o cadastro.";
+        return;
+      }
+      customerRequest = crypto.randomUUID();
+      customerLookup.disabled = true;
+      customerStatus.textContent = "Buscando cliente no CRM…";
+      window.parent.postMessage({type: "doss:customer-lookup", code: customerCode.value.trim(), requestId: customerRequest}, CRM_ORIGIN);
+      customerTimer = setTimeout(() => {
+        cancelCustomerLookup();
+        customerStatus.textContent = "A consulta não respondeu. Abra Fretes no CRM e tente novamente.";
+      }, 15000);
+    }
+    customerLookup.addEventListener("click", lookupCustomer);
+    customerCode.addEventListener("keydown", event => {
+      if (event.key === "Enter") { event.preventDefault(); lookupCustomer(); }
+    });
+    customerCode.addEventListener("input", () => {
+      cancelCustomerLookup();
+      document.getElementById("to_postal_code").value = "";
+      document.getElementById("recipient_doc").value = "";
+      customerStatus.textContent = "Pressione Enter ou Buscar para preencher o cadastro.";
+    });
+    window.addEventListener("message", event => {
+      if (event.origin !== CRM_ORIGIN || event.source !== window.parent ||
+          event.data?.type !== "doss:customer-result" || !customerRequest || event.data.requestId !== customerRequest) return;
+      cancelCustomerLookup();
+      if (event.data.error) { customerStatus.textContent = event.data.error; return; }
+      const customer = event.data.customer;
+      if (!customer || typeof customer.name !== "string") return;
+      const cep = String(customer.cep || "").replace(/[^0-9]/g, "");
+      const doc = String(customer.document || "").replace(/[^0-9]/g, "");
+      document.getElementById("to_postal_code").value = cep.length === 8 ? cep.slice(0,5) + "-" + cep.slice(5) : "";
+      document.getElementById("recipient_doc").value = [11,14].includes(doc.length) ? doc : "";
+      const missing = [];
+      if (cep.length !== 8) missing.push("CEP ausente ou inválido");
+      if (![11,14].includes(doc.length)) missing.push("CNPJ/CPF ausente ou inválido");
+      customerStatus.textContent = customer.name + (missing.length ? " — " + missing.join("; ") + ". Preencha manualmente." : " — CEP e documento preenchidos.");
+    });
+
     const form = document.getElementById("quote-form");
     const resetBtn = document.getElementById("reset-btn");
     const addVolumeBtn = document.getElementById("add-volume-btn");
@@ -1772,6 +1841,9 @@ HTML_PAGE = """
     }
 
     function resetFormValues() {
+      cancelCustomerLookup();
+      customerCode.value = "";
+      customerStatus.textContent = "No CRM, informe o código para preencher CEP e CNPJ/CPF.";
       document.getElementById("from_postal_code").value = "{{FROM_POSTAL_CODE_FORMATTED}}";
       document.getElementById("to_postal_code").value = "";
       document.getElementById("insurance_value").value = "0";
@@ -2092,3 +2164,4 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=8000)
+
