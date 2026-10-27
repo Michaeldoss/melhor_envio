@@ -13,7 +13,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-app = FastAPI(title="Calculadora de Fretes", version="4.2.0")
+app = FastAPI(title="Calculadora de Fretes", version="4.2.1")
 
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -48,6 +48,15 @@ SSW_DOMINIO = os.getenv("SSW_DOMINIO", "ARL")
 SSW_LOGIN = os.getenv("SSW_LOGIN", "45024640")
 SSW_SENHA = os.getenv("SSW_SENHA", "dgt71649")
 SSW_CNPJ_PAGADOR = os.getenv("SSW_CNPJ_PAGADOR", "40045152000125")  # DOSS Group
+
+# Cobertura operacional da Arlete validada antes da cotação SSW.
+# O SSW pode retornar tarifa para CEP fora da malha efetivamente atendida;
+# nesses casos a cotação não deve ser exibida como disponível.
+ARLETE_ALLOWED_UFS = {
+    uf.strip().upper()
+    for uf in os.getenv("ARLETE_ALLOWED_UFS", "SC,PR,RS,SP,RJ").split(",")
+    if uf.strip()
+}
 
 BOXES: dict[str, dict[str, float | str]] = {
     "1": {"label": "Caixa 1", "width": 26.0, "height": 19.0, "length": 36.0},
@@ -125,6 +134,10 @@ def delivery_label_from_days(days: int | None) -> str:
     if days is None:
         return "-"
     return f"{days} dia(s) úteis"
+
+
+def arlete_serves_uf(uf: str) -> bool:
+    return str(uf or "").strip().upper() in ARLETE_ALLOWED_UFS
 
 
 def classify_service(service_name: str, company_name: str = "", delivery_text: str = "", delivery_days: int | None = None) -> str:
@@ -2042,6 +2055,7 @@ def health() -> dict[str, Any]:
         "user_agent_configured": bool(MELHOR_ENVIO_USER_AGENT.strip()),
         "disktenha_enabled": DISKTENHA_ENABLED,
         "disktenha_cities_loaded": len(DISKTENHA_TABLE),
+        "arlete_allowed_ufs": sorted(ARLETE_ALLOWED_UFS),
     }
 
 
@@ -2095,29 +2109,40 @@ def quote(req: QuoteRequest) -> dict[str, Any]:
         except HTTPException as exc:
             all_options.append(provider_error_result("expresso_sm", "Expresso São Miguel", exc.detail))
 
-    # Arlete Transportes via SSW SOAP — CIF: a DOSS é sempre quem paga (tem tabela negociada)
+    # Arlete Transportes via SSW SOAP — CIF: a DOSS é sempre quem paga (tem tabela negociada).
+    # Primeiro valida a malha operacional: o SSW pode devolver tarifa mesmo para
+    # CEP fora da cobertura efetiva da transportadora.
     if SSW_ENABLED:
-        try:
-            ssw_client = SswClient(
-                endpoint=SSW_ENDPOINT,
-                dominio=SSW_DOMINIO,
-                login=SSW_LOGIN,
-                senha=SSW_SENHA,
-                cnpj_pagador=SSW_CNPJ_PAGADOR,  # DOSS — dono da tabela negociada com a Arlete
+        if not arlete_serves_uf(destination["uf"]):
+            all_options.append(
+                provider_error_result(
+                    "ssw_arlete",
+                    "Arlete Transportes",
+                    f"Arlete Transportes não atende {destination['city']}/{destination['uf']} pela malha cadastrada.",
+                )
             )
-            ssw_cubagem = get_total_cubagem_m3(volumes)
-            ssw_raw = ssw_client.calculate(
-                cep_origem=req.from_postal_code,
-                cep_destino=req.to_postal_code,
-                valor_nf=req.insurance_value,
-                quantidade=len(volumes),
-                peso=get_total_actual_weight(volumes),
-                volume_m3=ssw_cubagem,
-                cnpj_destinatario=digits_only(req.recipient_doc) if req.recipient_doc else "",
-            )
-            all_options.append(ssw_client.normalize_result(ssw_raw))
-        except HTTPException as exc:
-            all_options.append(provider_error_result("ssw_arlete", "Arlete Transportes", exc.detail))
+        else:
+            try:
+                ssw_client = SswClient(
+                    endpoint=SSW_ENDPOINT,
+                    dominio=SSW_DOMINIO,
+                    login=SSW_LOGIN,
+                    senha=SSW_SENHA,
+                    cnpj_pagador=SSW_CNPJ_PAGADOR,  # DOSS — dono da tabela negociada com a Arlete
+                )
+                ssw_cubagem = get_total_cubagem_m3(volumes)
+                ssw_raw = ssw_client.calculate(
+                    cep_origem=req.from_postal_code,
+                    cep_destino=req.to_postal_code,
+                    valor_nf=req.insurance_value,
+                    quantidade=len(volumes),
+                    peso=get_total_actual_weight(volumes),
+                    volume_m3=ssw_cubagem,
+                    cnpj_destinatario=digits_only(req.recipient_doc) if req.recipient_doc else "",
+                )
+                all_options.append(ssw_client.normalize_result(ssw_raw))
+            except HTTPException as exc:
+                all_options.append(provider_error_result("ssw_arlete", "Arlete Transportes", exc.detail))
 
     available = [item for item in all_options if not item["error"] and item["price"] is not None]
     unavailable = [item for item in all_options if item["error"] or item["price"] is None]
