@@ -12,8 +12,8 @@ const el = id => {
 }
 const sent = [], messages = [], parent = { postMessage: (data, origin) => sent.push({data, origin}) }
 let sequence = 0
-const window = { parent, addEventListener: (type, fn) => { if(type === 'message') messages.push(fn) } }
-vm.runInNewContext(bridge, { window, document: { getElementById: el }, crypto: { randomUUID: () => `request-${++sequence}` }, setTimeout: () => 1, clearTimeout: () => {} })
+const window = { parent, location:{search:''}, addEventListener: (type, fn) => { if(type === 'message') messages.push(fn) } }
+vm.runInNewContext(bridge, { window, document: { getElementById: el }, URLSearchParams, crypto: { randomUUID: () => `request-${++sequence}` }, setTimeout: () => 1, clearTimeout: () => {} })
 el('customer_code').value = '2174'
 el('customer_lookup').listeners.click()
 assert.equal(sent[0].origin, 'https://doss-crm.vercel.app')
@@ -43,4 +43,6 @@ el('customer_code').value='2174 OR 1=1'
 const before=sent.length
 el('customer_lookup').listeners.click()
 assert.equal(sent.length,before)
-console.log('12 freight field, origin, source and stale-response checks passed')
+assert.match(source,/new URLSearchParams\(window\.location\.search\)[\s\S]*crm_customer_code/)
+assert.match(source,/resetFormValues\(\);\s*if \(initialCustomerCode\) \{\s*customerCode\.value = initialCustomerCode;\s*lookupCustomer\(\);/)
+console.log('14 freight field, origin, source, stale-response and CRM prefill checks passed')
