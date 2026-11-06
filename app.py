@@ -1574,6 +1574,14 @@ HTML_PAGE = """
     const customerCode = document.getElementById("customer_code");
     const customerLookup = document.getElementById("customer_lookup");
     const customerStatus = document.getElementById("customer_lookup_status");
+    const initialCustomerCode = (() => {
+      try {
+        const code = new URLSearchParams(window.location.search).get("crm_customer_code") || "";
+        return /^[0-9]{1,20}$/.test(code) ? code : "";
+      } catch {
+        return "";
+      }
+    })();
     let customerRequest = null;
     let customerTimer = null;
     function cancelCustomerLookup() {
@@ -2011,6 +2019,10 @@ HTML_PAGE = """
     });
 
     resetFormValues();
+    if (initialCustomerCode) {
+      customerCode.value = initialCustomerCode;
+      lookupCustomer();
+    }
   </script>
 </body>
 </html>
